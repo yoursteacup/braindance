@@ -1,16 +1,25 @@
 from __future__ import annotations
 
+import asyncio
 import importlib
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+import local_provider
 import runtime_control
 
 
 app = FastAPI(title="Braindance Runtime")
+local_provider.GENERATED_DIR.mkdir(parents=True, exist_ok=True)
+app.mount(
+    "/dream-media",
+    StaticFiles(directory=str(local_provider.GENERATED_DIR)),
+    name="dream_media",
+)
 
 
 class ProcessRequest(BaseModel):
@@ -261,6 +270,24 @@ def root() -> HTMLResponse:
       letter-spacing: 0.12em;
       color: var(--muted);
     }
+    .dream-output {
+      display: grid;
+      gap: 10px;
+    }
+    .dream-preview {
+      width: 100%;
+      max-height: 360px;
+      object-fit: contain;
+      border-radius: 14px;
+      border: 1px solid rgba(110, 231, 255, 0.18);
+      background: rgba(0, 0, 0, 0.22);
+    }
+    .dream-preview[hidden] {
+      display: none;
+    }
+    .dream-error {
+      color: #ffb36b;
+    }
     .timeline {
       display: grid;
       gap: 10px;
@@ -484,6 +511,23 @@ def root() -> HTMLResponse:
           <div class="title">Chat Log</div>
           <div class="log" id="chatLog"></div>
         </div>
+        <div class="panel">
+          <div class="title">Dream Output</div>
+          <div class="dream-output">
+            <button type="button" id="generateDream">Generate Dream</button>
+            <div class="status" id="dreamStatus">No dream generated yet.</div>
+            <div>
+              <div class="action-type">Generated Text</div>
+              <pre id="dreamText">-</pre>
+            </div>
+            <div>
+              <div class="action-type">Generated Image Path</div>
+              <pre id="dreamImagePath">-</pre>
+            </div>
+            <img class="dream-preview" id="dreamPreview" alt="Generated dream frame" hidden>
+            <pre class="dream-error" id="dreamError"></pre>
+          </div>
+        </div>
       </div>
 
       <div class="stack">
@@ -545,10 +589,18 @@ def root() -> HTMLResponse:
     const stopRuntimeButton = document.getElementById("stopRuntime");
     const resetStateButton = document.getElementById("resetState");
     const runtimeStatusNode = document.getElementById("runtimeStatus");
+    const generateDreamButton = document.getElementById("generateDream");
+    const dreamStatusNode = document.getElementById("dreamStatus");
+    const dreamTextNode = document.getElementById("dreamText");
+    const dreamImagePathNode = document.getElementById("dreamImagePath");
+    const dreamPreviewNode = document.getElementById("dreamPreview");
+    const dreamErrorNode = document.getElementById("dreamError");
+    const rawSnapshotNode = document.getElementById("rawSnapshot");
 
     const chatLog = [];
     const shotHistory = [];
     let lastSpeechSignature = null;
+    let pollingTimer = null;
 
     function renderCharacter(character) {
       const entries = Object.entries(character || {});
@@ -689,6 +741,36 @@ def root() -> HTMLResponse:
       `).join("");
     }
 
+    function dreamPreviewUrl(path) {
+      if (!path) {
+        return null;
+      }
+      const marker = "/var/generated/";
+      const index = path.indexOf(marker);
+      if (index === -1) {
+        return null;
+      }
+      return `/dream-media/${encodeURIComponent(path.slice(index + marker.length))}`;
+    }
+
+    function renderDream(dream) {
+      const image = dream?.image || {};
+      dreamStatusNode.textContent =
+        `Provider: ${dream?.provider_status?.provider || "unknown"} | image: ${image.status || "none"} | source tick: ${dream?.source_tick ?? "-"}`;
+      dreamTextNode.textContent = dream?.generated_text || "-";
+      dreamImagePathNode.textContent = image.path || "-";
+      dreamErrorNode.textContent = image.error || dream?.provider_status?.last_text_error || "";
+
+      const previewUrl = dreamPreviewUrl(image.path);
+      if (previewUrl && image.status === "ok") {
+        dreamPreviewNode.src = `${previewUrl}?t=${Date.now()}`;
+        dreamPreviewNode.hidden = false;
+      } else {
+        dreamPreviewNode.hidden = true;
+        dreamPreviewNode.removeAttribute("src");
+      }
+    }
+
     function renderSnapshot(snapshot) {
       tickNode.textContent = snapshot.tick ?? "-";
       simTimeNode.textContent = snapshot.time ?? "";
@@ -696,6 +778,7 @@ def root() -> HTMLResponse:
       actionContentNode.textContent = snapshot.external_action?.content ?? "No external action yet.";
       receivedAtNode.textContent = `received ${new Date().toLocaleTimeString()}`;
       framePromptNode.textContent = snapshot.frame_prompt ?? "";
+      rawSnapshotNode.textContent = JSON.stringify(snapshot, null, 2);
       renderCharacter(snapshot.character);
       renderActiveProcess(snapshot.mental_queue, snapshot.external_action);
       renderQueue(snapshot.mental_queue);
@@ -708,6 +791,10 @@ def root() -> HTMLResponse:
       if (speechSignature && speechSignature !== lastSpeechSignature) {
         addLogEntry("runtime", speech.content);
         lastSpeechSignature = speechSignature;
+      }
+
+      if (snapshot.dream_output) {
+        renderDream(snapshot.dream_output);
       }
     }
 
@@ -724,12 +811,47 @@ def root() -> HTMLResponse:
       return response.json();
     }
 
+    function stopPolling() {
+      if (pollingTimer) {
+        window.clearInterval(pollingTimer);
+        pollingTimer = null;
+      }
+    }
+
+    function startPolling(reason) {
+      if (pollingTimer) {
+        return;
+      }
+
+      setConnection(false, `${reason}; polling /state`);
+
+      const poll = async () => {
+        try {
+          const response = await fetch("/state", { cache: "no-store" });
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+          }
+          const payload = await response.json();
+          renderSnapshot(payload.snapshot);
+          setConnection(true, "polling /state");
+        } catch (error) {
+          setConnection(false, `poll failed: ${error.message}`);
+        }
+      };
+
+      poll();
+      pollingTimer = window.setInterval(poll, 2000);
+    }
+
     function connect() {
       const protocol = window.location.protocol === "https:" ? "wss" : "ws";
       const socket = new WebSocket(`${protocol}://${window.location.host}/ws`);
+      let opened = false;
 
       socket.addEventListener("open", () => {
-        setConnection(true, "connected");
+        opened = true;
+        stopPolling();
+        setConnection(true, "websocket connected");
       });
 
       socket.addEventListener("message", (event) => {
@@ -737,8 +859,12 @@ def root() -> HTMLResponse:
       });
 
       socket.addEventListener("close", () => {
-        setConnection(false, "disconnected");
-        window.setTimeout(connect, 1000);
+        if (opened) {
+          setConnection(false, "websocket disconnected");
+          window.setTimeout(connect, 1000);
+          return;
+        }
+        startPolling("websocket unavailable");
       });
 
       socket.addEventListener("error", () => {
@@ -816,6 +942,24 @@ def root() -> HTMLResponse:
       }
     });
 
+    generateDreamButton.addEventListener("click", async () => {
+      generateDreamButton.disabled = true;
+      dreamStatusNode.textContent = "Generating dream. This may block while local GPU inference runs...";
+      dreamErrorNode.textContent = "";
+      try {
+        const payload = await callEndpoint("/dream");
+        renderDream(payload.dream);
+        if (payload.snapshot) {
+          renderSnapshot(payload.snapshot);
+        }
+      } catch (error) {
+        dreamStatusNode.textContent = `Dream failed: ${error.message}`;
+        dreamErrorNode.textContent = String(error.stack || error.message || error);
+      } finally {
+        generateDreamButton.disabled = false;
+      }
+    });
+
     connect();
   </script>
 </body>
@@ -861,6 +1005,13 @@ def runtime_status() -> dict:
 @app.post("/process")
 async def process(payload: ProcessRequest) -> dict:
     result = logic().process_message(payload.text)
+    await runtime_control.broadcast(result["snapshot"])
+    return result
+
+
+@app.post("/dream")
+async def dream() -> dict:
+    result = await asyncio.to_thread(logic().generate_dream)
     await runtime_control.broadcast(result["snapshot"])
     return result
 
